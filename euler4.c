@@ -1,5 +1,5 @@
 /*
- * search.c -- search for primitive integer solutions of
+ * euler4.c -- search for primitive integer solutions of
  *
  *      a^4 + b^4 + c^4 = d^4
  *
@@ -147,7 +147,8 @@ static const uint64_t small_prime_lim[] = {
 /* 64-bit factorisation                                               */
 /* ------------------------------------------------------------------ */
 
-/* 2*3*5*7*11*13*17*19*23*29*31*37*41*43*47*53 is near to 2^64, no more different factors */
+/* Any 64-bit number has at most 15 distinct prime factors because
+   2*3*5*...*53 > 2^64; 16 slots are enough. */
 #define MAX_FACTORS 16
 
 typedef struct {
@@ -167,29 +168,24 @@ static uint16_t *spf_table;
 uint64_t    pollard_counter = 0;
 #endif
 
-/* Can the bad prime p still occur in an unprocessed part?  If not, its
-   exponent is final and the candidate can be rejected immediately. */
+/* A part of the factorization still to be processed: v is its value and
+   mult is the multiplicity of this part in the original n. */
 typedef struct {
     uint64_t v;
     unsigned mult;
 } pending_t;
 
-/* ------------------------------------------------------------------ */
-/* residue table                                                      */
-/* ------------------------------------------------------------------ */
-
+/* Residues for c modulo PERIOD, filled by make_residue_table() before
+   the parallel loop. */
 static uint32_t residue_table[774];
 
-/* ------------------------------------------------------------------ */
-/* reporting                                                          */
-/* ------------------------------------------------------------------ */
-
+/* Solution log; report_solution() updates it under the critical section. */
 #define MAX_SOL 1024
 static uint64_t sol_a[MAX_SOL], sol_b[MAX_SOL], sol_c[MAX_SOL], sol_d[MAX_SOL];
 static int nsol;
 
 /* ------------------------------------------------------------------ */
-/* reconstruction of a^4 + b^4 = R                                    */
+/* data used by the Gaussian reconstruction                           */
 /* ------------------------------------------------------------------ */
 
 typedef struct { int64_t re, im; } gauss_t;
@@ -217,6 +213,10 @@ typedef struct {
     uint64_t q, c, d;
     int found;
 } enum_ctx;
+
+/* ------------------------------------------------------------------ */
+/* small arithmetic helpers                                           */
+/* ------------------------------------------------------------------ */
 
 /* a,b < m; return a * b % m */
 static inline uint64_t mulmod(uint64_t a, uint64_t b, uint64_t m)
@@ -267,7 +267,7 @@ static inline uint64_t reminder(unsigned __int128 a, uint64_t b)
 #endif
 }
 
-/* inversion of odd by 2^64 module */
+/* inverse of an odd n modulo 2^64 */
 static inline uint64_t mod_inv_2_64(uint64_t n) {
   assert(n % 2 == 1);
   uint64_t x = (3*n)^2; 
@@ -725,7 +725,8 @@ static uint64_t pollard_floyd(uint64_t m)
   return 0;
 }
 
-/* assert m in not prime; return m divider */
+/* Return a divisor of the odd composite mo->n, or 0 if all attempts
+   failed.  Brent's variant is tried first, Floyd is the fallback. */
 static uint64_t pollard(const mont_t *mo)
 {
   const uint64_t m = mo->n;
@@ -753,7 +754,7 @@ static uint64_t pollard(const mont_t *mo)
   return pollard_floyd(m);
 }
 
-/* miller-rabin test for 2 */
+/* Strong Miller-Rabin probable-prime test to base 2. */
 static int mont_miller_rabin(const mont_t *mo)
 {
   const uint64_t m = mo->n;
@@ -818,9 +819,10 @@ static inline size_t spf_index(uint64_t n)
  * Returns a prime divisor d (1 < d < n), n itself if n is prime, or
  * 0 when n > FACTOR_TABLE_LIMIT and must be handled by the primality
  * tests and Pollard rho.
+ *
+ * Keep this out of line: inlining it into process_odd bloats the
+ * factorization hot path and costs about 10% on long runs.
  */
-/* Keep this out of line: inlining it into process_odd bloats the
-   factorization hot path and costs about 10% on long runs. */
 static __attribute__((noinline)) uint64_t find_small_prime_divider(uint64_t n)
 {
     if (n <= FACTOR_TABLE_LIMIT) {
@@ -833,7 +835,7 @@ static __attribute__((noinline)) uint64_t find_small_prime_divider(uint64_t n)
 }
 
 /* ------------------------------------------------------------------ */
-/* good / bad prime classification                                    */
+/* factorisation and good / bad prime classification                  */
 /* ------------------------------------------------------------------ */
 static int add_pair(factor_t *pairs, int *ng, uint64_t p, unsigned e, uint64_t *q)
 {
@@ -880,6 +882,8 @@ static int merge_factor(factor_t *f, int *nf, uint64_t p, unsigned e)
     return (*nf)++;
 }
 
+/* Can the bad prime p still occur in an unprocessed part?  If not, its
+   exponent is final and the candidate can be rejected immediately. */
 static int p_still_possible(uint64_t p, uint64_t n,
                             const pending_t *stack, int sp)
 {
@@ -889,7 +893,7 @@ static int p_still_possible(uint64_t p, uint64_t n,
     return 0;
 }
 
-/* Strip all prime factors <= 2039 up front.  Every later part is a
+/* Strip small prime factors <= 2039 up front.  Every later part is a
    divisor of the stripped number, so these factors cannot reappear;
    if n drops below FACTOR_TABLE_LIMIT the SPF table finishes it.
    This keeps trial division out of the main factorization loop. */
@@ -922,7 +926,7 @@ static __attribute__((noinline)) unsigned small_odd_divider(uint64_t *n, factor_
 /*
  * Factor n (odd) and separate its primes into
  *
- *   p = 1 (mod 8)   -> good list (kept in R)
+ *   p = 1 (mod 8)   -> good list (used to build Rg)
  *   p != 1 (mod 8)  -> bad; exponent must be a multiple of 4,
  *                      then p^(e/4) goes into q.
  *
@@ -972,8 +976,8 @@ static int process_odd(uint64_t n, uint64_t *q, factor_t *pairs, int *idx)
 #endif
                     if (d <= 1 || d >= n) return 0;
 
-                    /* exact power of d in n; factor d first, as before,
-                       so a bad divisor stops the candidate immediately */
+                    /* exact power of d in n; factor d first so a bad
+                       divisor stops the candidate immediately */
                     unsigned k = 0;
                     do {
                         n /= d;
@@ -1011,6 +1015,10 @@ static int process_odd(uint64_t n, uint64_t *q, factor_t *pairs, int *idx)
     return 1;
 }
 
+/* ------------------------------------------------------------------ */
+/* smallest-prime-factor table construction                           */
+/* ------------------------------------------------------------------ */
+
 static int build_factor_table(void)
 {
     size_t count = ((size_t)FACTOR_TABLE_LIMIT / 15 + 1) * 4;
@@ -1033,6 +1041,10 @@ static int build_factor_table(void)
     }
     return 1;
 }
+
+/* ------------------------------------------------------------------ */
+/* residue table                                                      */
+/* ------------------------------------------------------------------ */
 
 static int residue_count;
 static void add_residue(uint32_t r)
@@ -1060,15 +1072,19 @@ static void make_residue_table(void)
     add_residue(443);
 }
 
+/* ------------------------------------------------------------------ */
+/* reporting                                                          */
+/* ------------------------------------------------------------------ */
+
 static int report_solution(uint64_t a, uint64_t b, uint64_t c, uint64_t d)
 {
     if (a > b) { uint64_t t = a; a = b; b = t; }
 
     if (gcd64(gcd64(a, b), gcd64(c, d)) != 1) return 0;
 
-    /* Subtract instead of adding three fourth powers: at d close to 2^32
-       their sum can exceed the u128 range even though the true equality
-       is below it. */
+    /* Subtract c^4 from d^4 instead of adding a^4 + b^4 + c^4: for d
+       close to 2^32 the sum can wrap around modulo 2^128, while d^4
+       itself still fits in u128. */
     u128 d4 = pow4_128(d);
     u128 c4 = pow4_128(c);
     if (c4 >= d4) return 0;
@@ -1112,6 +1128,10 @@ static int report_solution(uint64_t a, uint64_t b, uint64_t c, uint64_t d)
     return 1;
 }
 
+/* ------------------------------------------------------------------ */
+/* reconstruction of a^4 + b^4 = Rg                                   */
+/* ------------------------------------------------------------------ */
+
 static gauss_t gmul(gauss_t x, gauss_t y)
 {
     __int128 re = (__int128)x.re * y.re - (__int128)x.im * y.im;
@@ -1140,7 +1160,7 @@ static void gauss_repr_raw(uint64_t p, int64_t *A, int64_t *B)
     uint64_t x = b;
     uint64_t y2 = p - x * x;
     uint32_t y = is_square(y2);
-    /* Cornacchia's descent guarantees x != 0 and y^2 = p - x^2. */
+    /* Cornacchia's descent guarantees x != 0 and that p - x^2 is a square. */
     assert(y != 0 && x != 0);
     assert(x * x + (uint64_t)y * y == p);
 
@@ -1172,7 +1192,7 @@ static int gauss_pre_lookup(uint64_t p, int64_t *A, int64_t *B)
 static void build_gauss_precomp(void)
 {
     /* For p coprime to 30 the SPF table is an exact primality test up to
-       FACTOR_TABLE_LIMIT, so no separate isprime() call is needed. */
+       FACTOR_TABLE_LIMIT, so no separate primality check is needed. */
     uint32_t count = 0;
     for (uint32_t p = 17; p <= GAUSS_PRECOMP_LIMIT; p += 8)
         if (p % 3 && p % 5 && spf_table[spf_index(p)] == 0)
@@ -1203,7 +1223,8 @@ static void build_gauss_precomp(void)
     }
 }
 
-/* p = A^2 + B^2, p prime, p = 1 (mod 8) */
+/* p = A^2 + B^2, p prime, p = 1 (mod 8); use the precomputed table
+   when possible. */
 static void gauss_prime_repr(uint64_t p, int64_t *A, int64_t *B)
 {
     if (gauss_pre_lookup(p, A, B)) return;
@@ -1227,7 +1248,8 @@ static int enum_gauss(enum_ctx *ctx, int idx, gauss_t cur)
         uint64_t u = (uint64_t)re;
         uint64_t v = (uint64_t)im;
         if (u == 0 || v == 0) return 0;
-        /* The norm is R by construction; a mismatch would be a bug */
+        /* The norm is ctx->R (the Gaussian product Rg) by construction;
+           a mismatch would be a bug. */
         assert((u128)u * u + (u128)v * v == ctx->R);
 
         uint32_t ap = is_square(u);
@@ -1312,14 +1334,15 @@ uint64_t counters[32] = {0};
 static int check_candidate(uint64_t c, uint64_t d)
 {
     /* Note: gcd(c,d) need not be 1.  A common prime p is possible only
-       for p = 1 (mod 8); such primes are kept in R below. */
+       for p = 1 (mod 8); such primes stay in the good list and are kept
+       in the Gaussian product Rg below. */
 #ifdef USE_COUNTERS
     counters[0]++;
 #endif
 
     uint64_t x = d - c;
     uint64_t y = c + d;
-    uint64_t pz = d * d - x * y / 2; /* halfsum(c * c, d * d); */
+    uint64_t pz = d * d - x * y / 2; /* (c^2 + d^2) / 2 */
 
     /* powers of two (cheapest check, do it first) */
     unsigned vx = __builtin_ctzll(x);
@@ -1332,13 +1355,13 @@ static int check_candidate(uint64_t c, uint64_t d)
     uint64_t px = x >> vx;
     uint64_t py = y >> vy;
 
-    /* if ((px & 7) != 1 || (py & 7) != 1) return 0; */
+    /* The odd parts of x and y must agree modulo 8. */
     if (unlikely((px ^ py) & 7)) return 0;
 
     uint32_t delta2 = (uint32_t)(vt & 3);    /* 0 or 1 */
 
-    /* The odd part of a^4+b^4 is 1 mod 16. */
-    /* if (!delta2 && ((px ^ py) & 8) != 0) return 0; */
+    /* The odd part of a^4+b^4 is 1 mod 16; when delta2 == 0 this
+       forces an extra agreement in bit 3. */
     if (unlikely( (px ^ py) & ((delta2 ^ 1) << 3) )) return 0;
 #ifdef USE_COUNTERS
     counters[1]++;
@@ -1348,7 +1371,7 @@ static int check_candidate(uint64_t c, uint64_t d)
 
     uint64_t *f;
 
-    /* powers of five; 4 / 129 */
+    /* powers of five; this branch covers 4 of the 129 residues */
     if (unlikely(c % 5 != 0)) {
         /* d % 5 != 0.  Then exactly one of x,y,z is divisible by 5.
            For a possible solution all of the 5-adic valuation must sit
@@ -1394,10 +1417,12 @@ static int check_candidate(uint64_t c, uint64_t d)
 
     u128 R = (px << delta2) * py * (u128)pz;
 
-    /* 128 bit division is slow, calculate reminder one time for many modules */
+    /* 128-bit division is slow, so compute the remainder once for
+       several moduli. */
     uint64_t rem = reminder(R, (uint64_t)7 * 7 * 7 * 7 * 11 * 11 * 11 * 11 * 13 * 13 * 13 * 13 * 29 * 29 * 29 * 29);
 
-    /* a^4+b^4 may not be 7,8,11 (mod 13) or ... (mod 29) */
+    /* A fourth power cannot be 7, 8 or 11 (mod 13), nor any residue in
+       FORBIDDEN29 modulo 29. */
     uint32_t r29 = (uint32_t)(rem % 29);
     if (unlikely(FORBIDDEN29 & (1u << r29))) return 0;
 #ifdef USE_COUNTERS
@@ -1442,7 +1467,7 @@ static int check_candidate(uint64_t c, uint64_t d)
 
     /* The Gaussian product contains only primes p = 1 (mod 8) and the
        leftover factor 2^delta2.  Bad primes were already moved into q;
-       leaving them in R would make u^2 + v^2 = R unsolvable. */
+       leaving them in Rg would make u^2 + v^2 = Rg unsolvable. */
     u128 Rg = (u128)(delta2 + 1);
     for (int i = 0; i < ng; ++i) {
         uint64_t p = good[i].p;
