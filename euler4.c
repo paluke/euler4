@@ -3,7 +3,7 @@
  *
  *      a^4 + b^4 + c^4 = d^4
  *
- * Build:  gcc -O3 -fopenmp -march=native -DNDEBUG euler4.c
+ * Build:  gcc -O3 -fopenmp -march=native -DNDEBUG -o search euler4.c
  *
  * Run:    ./search [end]  or  ./search <start> <end>
  *         (default end = 3000000, start = 1)
@@ -369,7 +369,7 @@ static uint64_t powmod(uint64_t base, uint64_t power, uint64_t modul)
 {
   uint64_t result = 1;
   base = base % modul;
-  for(;;)
+  for (;;)
   {
     if (power & 1)
       result = mulmod(result, base, modul);
@@ -488,9 +488,9 @@ static __attribute__((noinline)) unsigned min_nonres(uint64_t n)
   uint64_t k;
   for (k = 131; ; k += 6)
   {
-     if(jacobi(k, n) == -1)
+     if (jacobi(k, n) == -1)
        return k;
-     if(jacobi(k + 2, n) == -1)
+     if (jacobi(k + 2, n) == -1)
        return k + 2;
   }
 }
@@ -624,13 +624,13 @@ static uint64_t pollard(const mont_t *mo)
   uint64_t m = mo->n;
   assert (m % 2 == 1);
   uint64_t a;
-  for(a = 1; a < m - 1; ++a) {
+  for (a = 1; a < m - 1; ++a) {
     uint64_t power = 1, lam = 1;
     uint64_t tortoise = a;
     uint64_t hare = addmod(mont_mul(mo, a, a), a, m);
     uint64_t prod = 1;
     uint64_t st = 0;
-    while(1) {
+    while (1) {
         uint64_t t = mont_mul(mo, submod(tortoise, hare, m), prod);
         if (t == 0) {
             t = binary_gcd_odd1(m, prod);
@@ -710,8 +710,9 @@ static uint64_t gcd64(uint64_t a, uint64_t b)
 
 static u128 pow4_128(uint64_t x)
 {
-    u128 t = (u128)x * x;
-    return t * t;
+    assert(x < (1ull << 32));
+    x = x * x;
+    return (u128)x * x;
 }
 
 /* index of n (gcd(n,30)=1):  n/30*8 + (n%30)*4/15 */
@@ -1614,7 +1615,7 @@ int main(int argc, char **argv)
            (unsigned long long)cand, nsol, (long)(time(NULL) - t0));
 #ifdef USE_COUNTERS
     printf("filters: %llu ", (unsigned long long)counters[0]);
-    for(unsigned i = 1; counters[i] != 0; ++i)
+    for (unsigned i = 1; counters[i] != 0; ++i)
         printf("(%u) %g %llu ", i, (double)counters[i]/counters[i-1],
                (unsigned long long)counters[i]);
     puts("");
