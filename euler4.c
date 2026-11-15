@@ -4,6 +4,7 @@
  *      a^4 + b^4 + c^4 = d^4
  *
  * Build:  gcc -O3 -fopenmp -march=native -DNDEBUG euler4.c
+ *
  * Run:    ./search [end]  or  ./search <start> <end>
  *         (default end = 3000000, start = 1)
  */
@@ -139,9 +140,8 @@ static const uint64_t small_prime_lim[] = {
 
 #define PERIOD  (625ULL * 16384ULL)
 
-/* d*d and (d^2+c^2)/2 must fit in uint64_t.  Since d = 1 (mod 8),
-   the largest value actually checked with this limit is 2^32-7. */
-#define MAX_D_LIMIT ((1ULL << 32) - 1)
+/* d*d and (d^2+c^2)/2 must fit in uint64_t. */
+#define MAX_D_LIMIT ((1ULL << 32) + 1)
 
 /* ------------------------------------------------------------------ */
 /* 64-bit factorisation                                               */
@@ -150,6 +150,10 @@ static const uint64_t small_prime_lim[] = {
 /* Any 64-bit number has at most 15 distinct prime factors because
    2*3*5*...*53 > 2^64; 16 slots are enough. */
 #define MAX_FACTORS 16
+
+/* The global good-prime list can collect primes from several factors;
+   every such product that fits in u128 has fewer than 20 distinct primes. */
+#define MAX_GOOD_FACTORS 20
 
 typedef struct {
     uint64_t p;
@@ -192,14 +196,15 @@ typedef struct { int64_t re, im; } gauss_t;
 
 /* Read-only table of representations for small good primes.  It is
    built before the parallel loop and then only read by the workers. */
-#define GAUSS_PRECOMP_LIMIT 10000000u
+#define GAUSS_PRECOMP_LIMIT 16000000u
 
 #if GAUSS_PRECOMP_LIMIT > FACTOR_TABLE_LIMIT
 #error "GAUSS_PRECOMP_LIMIT must not exceed FACTOR_TABLE_LIMIT"
 #endif
 
 typedef struct {
-    uint32_t p, A, B;
+    uint32_t p;
+    uint16_t A, B;
 } gauss_pre_t;
 
 static gauss_pre_t *gauss_pre;
@@ -514,18 +519,6 @@ static inline uint64_t mont_mul(const mont_t *mo, uint64_t a, uint64_t b)
   return u >= m ? u - m : u - m + mo->n;
 }
 
-static inline uint64_t mont_add(uint64_t a, uint64_t b, uint64_t n)
-{
-  uint64_t s = a + b;
-  return (s < a || s >= n) ? s - n : s;
-}
-
-static inline uint64_t gcd_odd(uint64_t a, uint64_t b)
-{
-  if (b == 0) return a;
-  return binary_gcd_odd(a, b >> __builtin_ctzll(b));
-}
-
 static void mont_init(mont_t *mo, uint64_t n)
 {
   mo->n = n;
@@ -621,137 +614,50 @@ static int lukastest(const mont_t *mo)
   return rx == ((n & 3) == 3 ? 0 : n - 1);
 }
 
-static inline uint64_t splitmix64(uint64_t *s)
+/* ------------------------------------------------------------------ */
+/* Pollard rho with Floyd cycle detection and batched gcd              */
+/* ------------------------------------------------------------------ */
+
+#define POLLARD_BATCH 128
+static uint64_t pollard(const mont_t *mo)
 {
-  uint64_t z = (*s += 0x9E3779B97F4A7C15ULL);
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  return z ^ (z >> 31);
-}
-
-/* ------------------------------------------------------------------ */
-/* Brent's variant of Pollard rho                                      */
-/* ------------------------------------------------------------------ */
-
-#define BRENT_BATCH 128
-#define BRENT_ATTEMPTS 32
-#define BRENT_STEP_LIMIT (1u << 22)
-/* Return a non-trivial divisor or 0 if this attempt failed. */
-static uint64_t brent_find(const mont_t *mo, uint64_t y0, uint64_t c0)
-{
-  const uint64_t n = mo->n;
-  const uint64_t c = c0;
-  uint64_t y = y0;
-  uint64_t x = y, ys = y;
-  uint64_t q = 1, g = 1, r = 1;
-  uint64_t steps = 0;
-
-  while (g == 1) {
-    x = y;
-    for (uint64_t i = 0; i < r; ++i)
-      y = mont_add(mont_mul(mo, y, y), c, n);
-    steps += r;
-
-    uint64_t k = 0;
-    while (k < r && g == 1) {
-      ys = y;
-      uint64_t lim = r - k;
-      if (lim > BRENT_BATCH) lim = BRENT_BATCH;
-
-      for (uint64_t i = 0; i < lim; ++i) {
-        y = mont_add(mont_mul(mo, y, y), c, n);
-        uint64_t d = x > y ? x - y : y - x;
-        q = mont_mul(mo, q, d);
-      }
-      steps += lim;
-
-      /* q may have accumulated all prime factors of n */
-      g = (q == 0) ? n : gcd_odd(n, q);
-      k += lim;
-    }
-
-    if (g != 1) break;
-    if (steps > BRENT_STEP_LIMIT) return 0;
-    r <<= 1;
-  }
-
-  if (g == n) {
-    /* Find the individual difference that shares a factor with n.
-       Before the last batch gcd(q,n) was 1, so the factor is in it. */
-    g = 1;
-    do {
-      ys = mont_add(mont_mul(mo, ys, ys), c, n);
-      uint64_t d = x > ys ? x - ys : ys - x;
-      if (d == 0) { g = n; break; }
-      g = gcd_odd(n, d);
-    } while (g == 1);
-  }
-
-  return (g > 1 && g < n) ? g : 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* original Floyd cycle implementation, fallback                       */
-/* ------------------------------------------------------------------ */
-static uint64_t pollard_floyd(uint64_t m)
-{
+  uint64_t m = mo->n;
+  assert (m % 2 == 1);
   uint64_t a;
-  for (a = 1; a < m - 1; ++a) {
+  for(a = 1; a < m - 1; ++a) {
     uint64_t power = 1, lam = 1;
     uint64_t tortoise = a;
-    uint64_t hare = addmod(mulmod(a, a, m), a, m);
+    uint64_t hare = addmod(mont_mul(mo, a, a), a, m);
     uint64_t prod = 1;
-    while (1) {
-      uint64_t t = mulmod(submod(tortoise, hare, m), prod, m);
-      if (t == 0) {
-        t = binary_gcd_odd1(m, prod);
-        if (t != 1)
-          return t;
-        break;
-      }
-      prod = t;
-      if (power == lam) {
-        t = binary_gcd_odd1(m, prod);
-        if (t != 1)
-          return t;
-        tortoise = hare;
-        power *= 2;
-        lam = 0;
-      }
-      hare = addmod(mulmod(hare, hare, m), a, m);
-      lam += 1;
+    uint64_t st = 0;
+    while(1) {
+        uint64_t t = mont_mul(mo, submod(tortoise, hare, m), prod);
+        if (t == 0) {
+            t = binary_gcd_odd1(m, prod);
+            if (t != 1) {
+                return t;
+            }
+            break;
+        }
+        prod = t;
+        if (power == lam || st >= POLLARD_BATCH) {
+
+            t = binary_gcd_odd1(m, prod);
+            st = 0;
+            if (t != 1)
+                return t;
+            if (power == lam) {
+                tortoise = hare;
+                power *= 2;
+                lam = 0;
+            }
+        }
+        hare = addmod(mont_mul(mo, hare, hare), a, m);
+        lam += 1;
+        ++st;
     }
   }
   return 0;
-}
-
-/* Return a divisor of the odd composite mo->n, or 0 if all attempts
-   failed.  Brent's variant is tried first, Floyd is the fallback. */
-static uint64_t pollard(const mont_t *mo)
-{
-  const uint64_t m = mo->n;
-  assert (m % 2 == 1);
-
-  uint64_t r2 = reminder((unsigned __int128)0 - m, m);
-
-  uint64_t state = m ^ 0x9E3779B97F4A7C15ULL;
-  for (int att = 0; att < BRENT_ATTEMPTS; ++att) {
-    uint64_t y0, c0;
-    if (att == 0) {
-      y0 = 2 % m;
-      c0 = 1;
-    } else {
-      y0 = 1 + splitmix64(&state) % (m - 1);
-      c0 = 1 + splitmix64(&state) % (m - 1);
-      if (c0 + 2 == m)      /* f has a fixed point for c = -2 */
-        c0 = 1;
-    }
-    uint64_t g = brent_find(mo, mont_mul(mo, y0, r2), mont_mul(mo, c0, r2));
-    if (g != 0)
-      return g;
-  }
-
-  return pollard_floyd(m);
 }
 
 /* Strong Miller-Rabin probable-prime test to base 2. */
@@ -837,8 +743,21 @@ static __attribute__((noinline)) uint64_t find_small_prime_divider(uint64_t n)
 /* ------------------------------------------------------------------ */
 /* factorisation and good / bad prime classification                  */
 /* ------------------------------------------------------------------ */
-static int add_pair(factor_t *pairs, int *ng, uint64_t p, unsigned e, uint64_t *q)
+/*
+ * Append a good prime factor, or fold a bad one into q.
+ *
+ * A good prime p must not already be present in pairs: the caller
+ * guarantees uniqueness.  This is why check_candidate() extracts
+ * g = gcd(px, py) before the first process_odd() call.  The residual
+ * factors px/g, py/g and pz/g^2 are pairwise coprime, and the primes of
+ * g are divided out of them, so no good prime can be appended twice.
+ *
+ * A bad prime must have an exponent divisible by 4; p^(e/4) goes into q.
+ */
+static int append_factor(factor_t *pairs, int *ng, uint64_t p, unsigned e, uint64_t *q)
 {
+    assert(e > 0);
+
     if ((p & 7) != 1) {
         if (e & 3) return 0;            /* not a fourth power */
 
@@ -850,17 +769,11 @@ static int add_pair(factor_t *pairs, int *ng, uint64_t p, unsigned e, uint64_t *
         *q = pp;
         return 1;
     }
-    int nk = *ng;
-    for (int i = 0; i < nk; ++i) {
-        if (pairs[i].p == p) {
-            pairs[i].e += e;
-            return 1;
-        }
-    }
-    assert(nk < MAX_FACTORS);
-    pairs[nk].p = p;
-    pairs[nk].e = e;
-    *ng = nk + 1;
+
+    assert(*ng < MAX_GOOD_FACTORS);
+    pairs[*ng].p = p;
+    pairs[*ng].e = e;
+    ++*ng;
     return 1;
 }
 
@@ -893,34 +806,63 @@ static int p_still_possible(uint64_t p, uint64_t n,
     return 0;
 }
 
-/* Strip small prime factors <= 2039 up front.  Every later part is a
+/* Factor n (< FACTOR_TABLE_LIMIT, coprime to 30) using the SPF table.
+   Adds every prime factor to pairs/q.  Returns 0 for a bad prime with
+   exponent not divisible by 4. */
+static int factor_by_spf(uint64_t n, uint64_t *q, factor_t *pairs, int *ng)
+{
+    assert(n < FACTOR_TABLE_LIMIT);
+
+    while (n > 1) {
+        uint64_t p = spf_table[spf_index(n)];
+        if (p == 0) {
+            p = n;
+            n = 1;
+        } else {
+            n /= p;
+        }
+
+        unsigned e = 1;
+        while (n % p == 0) {
+            n /= p;
+            ++e;
+        }
+
+        if (!append_factor(pairs, ng, p, e, q)) return 0;
+    }
+    return 1;
+}
+
+/* Strip all prime factors <= 2039 up front.  Every later part is a
    divisor of the stripped number, so these factors cannot reappear;
    if n drops below FACTOR_TABLE_LIMIT the SPF table finishes it.
-   This keeps trial division out of the main factorization loop. */
-static __attribute__((noinline)) unsigned small_odd_divider(uint64_t *n, factor_t *found)
+   Returns the remaining part, or 0 if the candidate is impossible. */
+static uint64_t factor_by_small_odd(uint64_t n, uint64_t *q,
+                                    factor_t *pairs, int *ng)
 {
-  int fi = 0;
-  for (unsigned i = 0; i < CNT(small_prime); ++i)
-  {
-     /* if (n % small_prime[i] == 0) */
-     if (*n * small_prime_inv[i] <= small_prime_lim[i]) {
-        unsigned k = 0;
-        do {
-            *n = *n * small_prime_inv[i];
-            ++k;
-        } while (*n * small_prime_inv[i] <= small_prime_lim[i]);
+    for (unsigned i = 2; i < CNT(small_prime); ++i) {
+        /* if (n % small_prime[i] == 0) */
+        if (n * small_prime_inv[i] <= small_prime_lim[i]) {
+            unsigned k = 0;
+            do {
+                n = n * small_prime_inv[i];
+                ++k;
+            } while (n * small_prime_inv[i] <= small_prime_lim[i]);
 
-        if ((k & 3) && (small_prime[i] & 7) != 1)
-            return -1;
+            if (!append_factor(pairs, ng, small_prime[i], k, q)) return 0;
 
-        assert(fi < MAX_FACTORS);
-        found[fi].p = small_prime[i];
-        found[fi].e = k;
-        ++fi;
-        if (*n < FACTOR_TABLE_LIMIT) break;
-     }
-  }
-  return fi;
+            if (n < FACTOR_TABLE_LIMIT) {
+                if (!factor_by_spf(n, q, pairs, ng)) return 0;
+                return 1;
+            }
+        }
+    }
+
+    if (n < FACTOR_TABLE_LIMIT) {
+        if (!factor_by_spf(n, q, pairs, ng)) return 0;
+        return 1;
+    }
+    return n;
 }
 
 /*
@@ -936,13 +878,16 @@ static __attribute__((noinline)) unsigned small_odd_divider(uint64_t *n, factor_
  */
 static int process_odd(uint64_t n, uint64_t *q, factor_t *pairs, int *idx)
 {
+    assert((n & 1) != 0);
+    n = factor_by_small_odd(n, q, pairs, idx);
+    if (n <= 1) return (int)n;
+
     pending_t stack[MAX_FACTORS];
     int sp = 0;
     unsigned mult = 1;
 
     factor_t found[MAX_FACTORS];
-    int nf = small_odd_divider(&n, found);
-    if (nf < 0) return 0;
+    int nf = 0;
 
     for (;;) {
         while (n > 1) {
@@ -1009,7 +954,7 @@ static int process_odd(uint64_t n, uint64_t *q, factor_t *pairs, int *idx)
     }
 
     for (int i = 0; i < nf; ++i)
-        if (!add_pair(pairs, idx, found[i].p, found[i].e, q))
+        if (!append_factor(pairs, idx, found[i].p, found[i].e, q))
             return 0;
 
     return 1;
@@ -1206,6 +1151,7 @@ static void build_gauss_precomp(void)
                         "computing representations on demand\n");
         return;
     }
+    printf("Build Gaussian table for %u primes\n", count);
     gauss_pre_mask = size - 1;
 
     for (uint32_t p = 17; p <= GAUSS_PRECOMP_LIMIT; p += 8) {
@@ -1214,12 +1160,12 @@ static void build_gauss_precomp(void)
 
         int64_t A, B;
         gauss_repr_raw(p, &A, &B);
-
+        assert(A < 65536 && B < 65536);
         size_t h = gauss_pre_hash(p);
         while (gauss_pre[h].p != 0) h = (h + 1) & gauss_pre_mask;
         gauss_pre[h].p = p;
-        gauss_pre[h].A = (uint32_t)A;
-        gauss_pre[h].B = (uint32_t)B;
+        gauss_pre[h].A = (uint16_t)A;
+        gauss_pre[h].B = (uint16_t)B;
     }
 }
 
@@ -1455,8 +1401,46 @@ static int check_candidate(uint64_t c, uint64_t d)
     counters[9]++;
 #endif
 
-    factor_t good[MAX_FACTORS];
+    /* Good primes from px, py and pz are collected in this list. */
+    factor_t good[MAX_GOOD_FACTORS];
     int ng = 0;
+
+    /* Take out the common divisor of px and py before the first
+       process_odd() call.  For odd c and d, an odd prime p | g divides
+       both c and d, and its exponents in px, py, pz add up to four
+       times its exponent in g plus the surplus in the one factor that
+       contains the whole p-adic part.  Hence
+           px*py*pz = g^4 * (px/g)*(py/g)*(pz/g^2),
+       and the three residual factors are pairwise coprime.  The primes
+       of g are then divided out of the residuals, so every good prime
+       is appended exactly once and append_factor() needs no duplicate
+       search. */
+    uint64_t g = binary_gcd_odd(px, py);
+    if (unlikely(g > 1)) {
+        uint64_t q1 = 1;
+        if (!process_odd(g, &q1, good, &ng)) return 0;
+        if (q1 > 1) return 0;
+        assert(ng > 0);
+        px = px / g;
+        py = py / g;
+        assert(pz % (g * g) == 0);
+        pz = pz / (g * g);
+        for (int i = 0; i < ng; ++i) {
+            good[i].e *= 4;
+            while (px % good[i].p == 0) {
+                px = px / good[i].p;
+                good[i].e += 1;
+            }
+            while (py % good[i].p == 0) {
+                py = py / good[i].p;
+                good[i].e += 1;
+            }
+            while (pz % good[i].p == 0) {
+                pz = pz / good[i].p;
+                good[i].e += 1;
+            }
+        }
+    }
 
     if (!process_odd((px < py) ? px : py, &q, good, &ng)) return 0;
     if (!process_odd((px < py) ? py : px, &q, good, &ng)) return 0;
@@ -1551,7 +1535,7 @@ int main(int argc, char **argv)
 #endif
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 25) reduction(+:cand)
+#pragma omp parallel for schedule(dynamic, 15) reduction(+:cand)
 #endif
     for (uint64_t d = start; d <= limit; d += 8) {
         if (d % 5 == 0) continue;
